@@ -11,6 +11,7 @@ import json
 from calendar import monthrange
 from dataclasses import dataclass, field
 from datetime import date
+from decimal import Decimal, ROUND_HALF_UP
 from pathlib import Path
 from typing import Literal
 
@@ -71,6 +72,7 @@ class CreditorRules:
 # Date helpers
 # ---------------------------------------------------------------------------
 
+
 def end_of_month(d: date) -> date:
     return date(d.year, d.month, monthrange(d.year, d.month)[1])
 
@@ -80,7 +82,7 @@ def is_end_of_month(d: date) -> bool:
 
 
 def add_months(d: date, n: int) -> date:
-    """Shift a date by ``n`` whole months, clamping the day to month length."""
+    """Shift a date by `n` whole months, clamping the day to month length."""
     total = (d.year * 12 + (d.month - 1)) + n
     year, month = divmod(total, 12)
     month += 1
@@ -94,19 +96,22 @@ def default_first_payment_date(client: Client) -> date:
 
 
 def monthly_payment_dates(start: date, count: int) -> list[date]:
-    """Generate ``count`` monthly dates from ``start``.
+    """Generate `count` monthly dates from `start`.
 
-    If ``start`` is the last day of its month, every generated date is the last
+    If `start` is the last day of its month, every generated date is the last
     day of its month (true EOM cadence). Otherwise the day-of-month is preserved
     (clamped to month length).
     """
     if count <= 0:
         return []
+
     eom = is_end_of_month(start)
     out: list[date] = []
+
     for i in range(count):
         d = add_months(start, i)
         out.append(end_of_month(d) if eom else d)
+
     return out
 
 
@@ -114,12 +119,14 @@ def monthly_payment_dates(start: date, count: int) -> list[date]:
 # Loaders
 # ---------------------------------------------------------------------------
 
+
 def _d(s: str) -> date:
     return date.fromisoformat(s)
 
 
 def load_client(path: str | Path) -> Client:
     raw = json.loads(Path(path).read_text())
+
     return Client(
         draft_amount_cents=int(raw["draft_amount_cents"]),
         draft_day=int(raw["draft_day"]),
@@ -128,7 +135,11 @@ def load_client(path: str | Path) -> Client:
         as_of_date=_d(raw["as_of_date"]),
         current_balance_cents=int(raw["current_balance_cents"]),
         ledger=[
-            LedgerEntry(_d(e["date"]), int(e["amount_cents"]), e["type"])
+            LedgerEntry(
+                _d(e["date"]),
+                int(e["amount_cents"]),
+                e["type"],
+            )
             for e in raw.get("ledger", [])
         ],
     )
@@ -137,6 +148,7 @@ def load_client(path: str | Path) -> Client:
 def load_offer(path: str | Path) -> Offer:
     raw = json.loads(Path(path).read_text())
     fpd = raw.get("first_payment_date")
+
     return Offer(
         creditor=raw["creditor"],
         current_balance_cents=int(raw["current_balance_cents"]),
@@ -148,12 +160,16 @@ def load_offer(path: str | Path) -> Offer:
 
 def load_creditor_rules(path: str | Path) -> CreditorRules:
     raw = json.loads(Path(path).read_text())
+
     return CreditorRules(
         max_terms=int(raw["max_terms"]),
         max_payments=int(raw["max_payments"]),
         min_payment_cents=int(raw["min_payment_cents"]),
         max_token_pays=int(raw["max_token_pays"]),
-        min_payment_tiers=[(int(a), int(b)) for a, b in raw.get("min_payment_tiers", [])],
+        min_payment_tiers=[
+            (int(a), int(b))
+            for a, b in raw.get("min_payment_tiers", [])
+        ],
         even_pays=bool(raw.get("even_pays", False)),
         is_ballooning_allowed=bool(raw.get("is_ballooning_allowed", False)),
         max_segments=int(raw.get("max_segments", 4)),
@@ -164,6 +180,7 @@ def load_creditor_rules(path: str | Path) -> CreditorRules:
 
 def load_case(case_dir: str | Path) -> tuple[Client, Offer, CreditorRules]:
     p = Path(case_dir)
+
     return (
         load_client(p / "client.json"),
         load_offer(p / "offer.json"),
@@ -171,9 +188,23 @@ def load_case(case_dir: str | Path) -> tuple[Client, Offer, CreditorRules]:
     )
 
 
+def _round_half_up(value: float) -> int:
+    """Round a monetary calculation using the assignment's half-up rule."""
+    return int(
+        Decimal(str(value)).quantize(
+            Decimal("1"),
+            rounding=ROUND_HALF_UP,
+        )
+    )
+
+
 def offer_total_cents(offer: Offer) -> int:
-    return round(offer.settlement_pct * offer.current_balance_cents)
+    return _round_half_up(
+        offer.settlement_pct * offer.current_balance_cents
+    )
 
 
 def program_fee_cents(offer: Offer, rules: CreditorRules) -> int:
-    return round(rules.program_fee_pct * offer.original_balance_cents)
+    return _round_half_up(
+        rules.program_fee_pct * offer.original_balance_cents
+    )

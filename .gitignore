@@ -1,3 +1,7 @@
 __MACOSX/
 .DS_Store
 **/.DS_Store
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
