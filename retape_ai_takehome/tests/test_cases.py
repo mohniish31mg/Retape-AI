@@ -944,3 +944,292 @@ def test_case37_equal_fee_front_loading_prefers_earlier_creditor_recovery():
         payments[i] <= payments[i + 1]
         for i in range(len(payments) - 1)
     )
+
+
+def test_case38_program_fee_waits_for_future_fixed_debit():
+    client = _make_client(
+        ledger=[
+            LedgerEntry(date(2026, 1, 1), 10000, "credit"),
+            LedgerEntry(date(2026, 2, 1), 10000, "credit"),
+            LedgerEntry(date(2026, 2, 1), 15000, "debit"),
+            LedgerEntry(date(2026, 3, 1), 10000, "credit"),
+        ],
+        # Horizon must reach the March EOM cadence date so the remaining
+        # program fee can be collected after the February fixed debit.
+        last_draft_date=date(2026, 3, 31),
+    )
+
+    offer = _make_offer(
+        current_balance_cents=2500,
+        original_balance_cents=10000,
+        settlement_pct=1.0,
+        first_payment_date=date(2026, 1, 31),
+    )
+
+    rules = _make_rules(
+        max_terms=1,
+        max_payments=1,
+        min_payment_cents=2500,
+        bank_fee_cents=0,
+        program_fee_pct=0.5,
+    )
+
+    r = evaluate_offer(client, offer, rules)
+
+    assert r.feasible is True
+    assert r.schedule is not None
+
+    # The January balance after the creditor payment is $75.
+    # $50 must be preserved for the future February deficit.
+    # Therefore only $25 of the $50 program fee can be collected in January.
+    jan = next(
+        row for row in r.schedule
+        if row.date == date(2026, 1, 31)
+    )
+
+    assert jan.creditor_payment_cents == 2500
+    assert jan.program_fee_cents == 2500
+
+    # The remaining $25 is collected later after the future debit
+    # has been accounted for.
+    mar = next(
+        row for row in r.schedule
+        if row.date == date(2026, 3, 31)
+    )
+
+    assert mar.creditor_payment_cents == 0
+    assert mar.program_fee_cents == 2500
+
+
+def test_case39_fee_only_date_has_no_bank_fee():
+    client = _make_client(
+        ledger=[
+            LedgerEntry(date(2026, 1, 1), 10000, "credit"),
+            LedgerEntry(date(2026, 2, 1), 10000, "credit"),
+        ],
+        last_draft_date=date(2026, 2, 28),
+    )
+
+    offer = _make_offer(
+        current_balance_cents=5000,
+        original_balance_cents=10000,
+        settlement_pct=1.0,
+        first_payment_date=date(2026, 1, 31),
+    )
+
+    rules = _make_rules(
+        max_terms=1,
+        max_payments=1,
+        min_payment_cents=5000,
+        bank_fee_cents=1000,
+        program_fee_pct=0.5,
+    )
+
+    r = evaluate_offer(client, offer, rules)
+
+    assert r.feasible is True
+    assert r.schedule is not None
+
+    fee_only_rows = [
+        row
+        for row in r.schedule
+        if (
+            row.creditor_payment_cents == 0
+            and row.program_fee_cents > 0
+        )
+    ]
+
+    assert fee_only_rows
+
+    # A fee-only date must never have a bank fee.
+    assert all(
+        row.bank_fee_cents == 0
+        for row in fee_only_rows
+    )
+
+
+def test_case40_program_fee_can_be_split_across_multiple_cadence_dates():
+    client = _make_client(
+        ledger=[
+            LedgerEntry(date(2026, 1, 1), 5000, "credit"),
+            LedgerEntry(date(2026, 2, 1), 5000, "credit"),
+            LedgerEntry(date(2026, 3, 1), 5000, "credit"),
+        ],
+        last_draft_date=date(2026, 3, 31),
+    )
+
+    offer = _make_offer(
+        current_balance_cents=5000,
+        original_balance_cents=10000,
+        settlement_pct=1.0,
+        first_payment_date=date(2026, 1, 31),
+    )
+
+    rules = _make_rules(
+        max_terms=1,
+        max_payments=1,
+        min_payment_cents=5000,
+        bank_fee_cents=0,
+        program_fee_pct=0.9,
+    )
+
+    r = evaluate_offer(client, offer, rules)
+
+    assert r.feasible is True
+    assert r.schedule is not None
+
+    fee_total = sum(
+        row.program_fee_cents
+        for row in r.schedule
+    )
+
+    assert fee_total == 9000
+
+    fee_rows = [
+        row
+        for row in r.schedule
+        if row.program_fee_cents > 0
+    ]
+
+    # The complete fee is allowed to be collected over multiple
+    # cadence dates when the earliest date cannot safely fund it all.
+    assert len(fee_rows) >= 2
+
+
+def test_case41_future_credits_offset_future_fixed_debits():
+    client = _make_client(
+        ledger=[
+            LedgerEntry(date(2026, 1, 1), 5000, "credit"),
+            LedgerEntry(date(2026, 2, 1), 15000, "credit"),
+            LedgerEntry(date(2026, 2, 1), 12000, "debit"),
+        ],
+        last_draft_date=date(2026, 2, 28),
+    )
+
+    offer = _make_offer(
+        current_balance_cents=2500,
+        original_balance_cents=10000,
+        settlement_pct=1.0,
+        first_payment_date=date(2026, 1, 31),
+    )
+
+    rules = _make_rules(
+        max_terms=1,
+        max_payments=1,
+        min_payment_cents=2500,
+        bank_fee_cents=0,
+        program_fee_pct=0.5,
+    )
+
+    r = evaluate_offer(client, offer, rules)
+
+    assert r.feasible is True
+    assert r.schedule is not None
+
+    jan = next(
+        row
+        for row in r.schedule
+        if row.date == date(2026, 1, 31)
+    )
+
+    # After the January creditor payment, $2,500 remains.
+    # The February ledger has a $15,000 credit and $12,000 debit,
+    # so the future net mandatory requirement is only $0.
+    # Therefore the complete $5,000 fee can be collected over the
+    # available cadence dates without making the account negative.
+    assert jan.program_fee_cents == 2500
+
+    assert sum(
+        row.program_fee_cents
+        for row in r.schedule
+    ) == 5000
+
+def test_case42_program_fee_cannot_be_collected_before_first_payment():
+    client = _make_client(
+        ledger=[
+            LedgerEntry(date(2026, 1, 1), 10000, "credit"),
+            LedgerEntry(date(2026, 2, 1), 10000, "credit"),
+        ],
+        last_draft_date=date(2026, 2, 28),
+    )
+
+    offer = _make_offer(
+        current_balance_cents=2500,
+        original_balance_cents=10000,
+        settlement_pct=1.0,
+        first_payment_date=date(2026, 2, 28),
+    )
+
+    rules = _make_rules(
+        max_terms=1,
+        max_payments=1,
+        min_payment_cents=2500,
+        bank_fee_cents=0,
+        program_fee_pct=0.5,
+    )
+
+    r = evaluate_offer(client, offer, rules)
+
+    assert r.feasible is True
+    assert r.schedule is not None
+
+    # January is before the first creditor payment date.
+    # Therefore no program fee may be collected in January.
+    assert all(
+        not (
+            row.date < date(2026, 2, 28)
+            and row.program_fee_cents > 0
+        )
+        for row in r.schedule
+    )
+
+
+def test_case43_future_fixed_debit_can_make_early_fee_collection_infeasible():
+    # Without the February credit, total inflow is only 20_000 while
+    # creditor + fee + fixed debit need 22_500 — genuinely infeasible.
+    # Add the February credit so the Feb net deficit is 5_000 and the
+    # offer stays feasible while still forcing the January fee to wait.
+    client = _make_client(
+        ledger=[
+            LedgerEntry(date(2026, 1, 1), 10000, "credit"),
+            LedgerEntry(date(2026, 2, 1), 10000, "credit"),
+            LedgerEntry(date(2026, 2, 1), 15000, "debit"),
+            LedgerEntry(date(2026, 3, 1), 10000, "credit"),
+        ],
+        last_draft_date=date(2026, 3, 31),
+    )
+
+    offer = _make_offer(
+        current_balance_cents=2500,
+        original_balance_cents=10000,
+        settlement_pct=1.0,
+        first_payment_date=date(2026, 1, 31),
+    )
+
+    rules = _make_rules(
+        max_terms=1,
+        max_payments=1,
+        min_payment_cents=2500,
+        bank_fee_cents=0,
+        program_fee_pct=0.5,
+    )
+
+    r = evaluate_offer(client, offer, rules)
+
+    assert r.feasible is True
+    assert r.schedule is not None
+
+    jan = next(
+        row for row in r.schedule
+        if row.date == date(2026, 1, 31)
+    )
+
+    # After the $25 creditor payment, $75 remains.
+    # February's net mandatory flow is -$50, so only $25 of the $50 fee
+    # is safe to collect in January.
+    assert jan.program_fee_cents == 2500
+
+    assert sum(
+        row.program_fee_cents
+        for row in r.schedule
+    ) == 5000    

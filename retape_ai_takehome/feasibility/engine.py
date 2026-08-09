@@ -504,7 +504,7 @@ def _simulate(
     payments: list[int],
     extra_ledger: tuple[LedgerEntry, ...] = (),
 ):
-    """Simulate the complete account and collect the fee as early as possible."""
+    """Simulate the account while front-loading the program fee safely."""
 
     fee_total = _program_fee(offer, rules)
 
@@ -519,7 +519,16 @@ def _simulate(
         )
     ]
 
-    future_entries.extend(extra_ledger)
+    # Additional funding used by Part 2 is treated as another future
+    # ledger entry, but only when it falls inside the simulation horizon.
+    future_entries.extend(
+        entry
+        for entry in extra_ledger
+        if (
+            entry.date > client.as_of_date
+            and entry.date <= client.last_draft_date
+        )
+    )
 
     entries_by_date: dict[date, list[LedgerEntry]] = {}
 
@@ -553,26 +562,114 @@ def _simulate(
 
     cadence_set = set(cadence_dates)
 
-    # We need to visit every date which can affect the balance or collect fee.
+    # Every date that can affect the account or collect the program fee.
     event_dates = (
         set(entries_by_date)
         | set(payment_dates)
         | cadence_set
     )
 
+    sorted_dates = sorted(event_dates)
+
+    # ------------------------------------------------------------------
+    # Precompute mandatory cash flow for every event date.
+    #
+    # Program fee is NOT included here because it is flexible.
+    # Everything else is mandatory:
+    #   ledger credits
+    #   ledger debits
+    #   creditor payment
+    #   bank fee
+    #
+    # Positive value  -> mandatory cash coming in.
+    # Negative value  -> mandatory cash going out.
+    # ------------------------------------------------------------------
+
+    mandatory_net: dict[date, int] = {}
+
+    for current_date in sorted_dates:
+        credits = sum(
+            entry.amount_cents
+            for entry in entries_by_date.get(current_date, [])
+            if entry.type == "credit"
+        )
+
+        fixed_debits = sum(
+            entry.amount_cents
+            for entry in entries_by_date.get(current_date, [])
+            if entry.type == "debit"
+        )
+
+        creditor_payment = payments_by_date.get(
+            current_date,
+            0,
+        )
+
+        bank_fee = (
+            rules.bank_fee_cents
+            if creditor_payment > 0
+            else 0
+        )
+
+        mandatory_net[current_date] = (
+            credits
+            - fixed_debits
+            - creditor_payment
+            - bank_fee
+        )
+
+    # ------------------------------------------------------------------
+    # Calculate the minimum amount that must be kept after each date
+    # to survive all FUTURE mandatory transactions.
+    #
+    # Example:
+    #
+    # Current balance after today's mandatory transactions = $100
+    #
+    # Future mandatory movements:
+    #   +$20
+    #   -$80
+    #   -$30
+    #
+    # We must retain $90 today, because the future cash flow can reach
+    # a cumulative deficit of $90.
+    #
+    # Program fees are intentionally excluded because their timing is
+    # flexible and therefore they should not consume this reserve.
+    # ------------------------------------------------------------------
+
+    future_reserve_after: dict[date, int] = {}
+
+    reserve_after_future = 0
+
+    for current_date in reversed(sorted_dates):
+        # The reserve required after this date must account for all
+        # mandatory movements strictly after this date.
+        future_reserve_after[current_date] = reserve_after_future
+
+        # Add this date's mandatory movement so that the next earlier
+        # date knows how much cash is required to survive through here.
+        reserve_after_future = max(
+            0,
+            reserve_after_future - mandatory_net[current_date],
+        )
+
     balance = client.current_balance_cents
     remaining_fee = fee_total
 
     rows: list[ScheduleRow] = []
 
-    # Amount of program fee collected on each cadence date.
-    # This is used for the front-loading comparison between candidates.
+    # Program-fee amount collected at each cadence date.
+    # Used to compare candidate schedules lexicographically.
     fee_vector: list[int] = []
 
-    for current_date in sorted(event_dates):
+    for current_date in sorted_dates:
 
-        # Assignment requirement:
-        # all ledger credits happen before all ledger debits on a date.
+        # --------------------------------------------------------------
+        # Same-day ordering:
+        # all ledger credits happen before all ledger debits.
+        # --------------------------------------------------------------
+
         credits = sum(
             entry.amount_cents
             for entry in entries_by_date.get(current_date, [])
@@ -586,17 +683,24 @@ def _simulate(
         )
 
         balance += credits
+
+        if balance < 0:
+            return None
+
         balance -= fixed_debits
 
         if balance < 0:
             return None
+
+        # --------------------------------------------------------------
+        # Creditor payment and bank fee are mandatory.
+        # --------------------------------------------------------------
 
         creditor_payment = payments_by_date.get(
             current_date,
             0,
         )
 
-        # Bank fee is charged only when a creditor payment is made.
         bank_fee = (
             rules.bank_fee_cents
             if creditor_payment > 0
@@ -608,23 +712,39 @@ def _simulate(
             + bank_fee
         )
 
-        # Creditor payment and bank fee are mandatory.
         if balance < required_payment:
             return None
 
         balance -= required_payment
 
+        # --------------------------------------------------------------
+        # Program fee is flexible.
+        #
+        # We can collect it only on/after the first creditor payment
+        # cadence. We take the maximum amount that is safe to take now
+        # while preserving enough cash for ALL future mandatory
+        # transactions.
+        # --------------------------------------------------------------
+
         program_fee = 0
 
-        # Program fee is optional in timing but mandatory in total.
-        # Collect as much as possible at the earliest eligible cadence date.
         if (
             current_date in cadence_set
             and remaining_fee > 0
         ):
+            future_reserve = future_reserve_after.get(
+                current_date,
+                0,
+            )
+
+            safe_fee_capacity = max(
+                0,
+                balance - future_reserve,
+            )
+
             program_fee = min(
                 remaining_fee,
-                balance,
+                safe_fee_capacity,
             )
 
             balance -= program_fee
@@ -633,8 +753,19 @@ def _simulate(
         if balance < 0:
             return None
 
-        # Output only dates which actually carry something relevant to the
-        # settlement schedule.
+        # --------------------------------------------------------------
+        # Keep the output focused on dates that actually carry a
+        # settlement payment or program fee.
+        #
+        # A fee-only date therefore appears as:
+        #
+        # creditor_payment = 0
+        # bank_fee          = 0
+        # program_fee       > 0
+        #
+        # No bank fee is charged on such a date.
+        # --------------------------------------------------------------
+
         if (
             creditor_payment > 0
             or program_fee > 0
@@ -657,7 +788,6 @@ def _simulate(
         return None
 
     return rows, tuple(fee_vector)
-
 
 # ---------------------------------------------------------------------------
 # Candidate selection
